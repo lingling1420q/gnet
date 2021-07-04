@@ -1,5 +1,5 @@
-// Copyright (c) 2019 Andy Pan
-// Copyright (c) 2018 Joshua J Baker
+// Copyright (c) 2020 Andy Pan
+// Copyright (c) 2017 Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -19,56 +19,33 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package gnet
+// +build linux freebsd dragonfly darwin
+
+// Package socket provides functions that return fd and net.Addr based on
+// given the protocol and address with a SO_REUSEPORT option set to the socket.
+package socket
 
 import (
-	"runtime"
-	"time"
+	"net"
 )
 
-func (svr *server) listenerRun(lockOSThread bool) {
-	if lockOSThread {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-	}
+// Option is used for setting an option on socket.
+type Option struct {
+	SetSockopt func(int, int) error
+	Opt        int
+}
 
-	var err error
-	defer func() { svr.signalShutdownWithErr(err) }()
-	var buffer [0x10000]byte
-	for {
-		if svr.ln.pconn != nil {
-			// Read data from UDP socket.
-			n, addr, e := svr.ln.pconn.ReadFrom(buffer[:])
-			if e != nil {
-				err = e
-				return
-			}
+// TCPSocket calls the internal tcpSocket.
+func TCPSocket(proto, addr string, sockopts ...Option) (int, net.Addr, error) {
+	return tcpSocket(proto, addr, sockopts...)
+}
 
-			el := svr.lb.next(addr)
-			c := newUDPConn(el, svr.ln.lnaddr, addr)
-			el.ch <- packUDPConn(c, buffer[:n])
-		} else {
-			// Accept TCP socket.
-			conn, e := svr.ln.ln.Accept()
-			if e != nil {
-				err = e
-				return
-			}
-			el := svr.lb.next(conn.RemoteAddr())
-			c := newTCPConn(conn, el)
-			el.ch <- c
-			go func() {
-				var buffer [0x10000]byte
-				for {
-					n, err := c.conn.Read(buffer[:])
-					if err != nil {
-						_ = c.conn.SetReadDeadline(time.Time{})
-						el.ch <- &stderr{c, err}
-						return
-					}
-					el.ch <- packTCPConn(c, buffer[:n])
-				}
-			}()
-		}
-	}
+// UDPSocket calls the internal udpSocket.
+func UDPSocket(proto, addr string, sockopts ...Option) (int, net.Addr, error) {
+	return udpSocket(proto, addr, sockopts...)
+}
+
+// UnixSocket calls the internal udsSocket.
+func UnixSocket(proto, addr string, sockopts ...Option) (int, net.Addr, error) {
+	return udsSocket(proto, addr, sockopts...)
 }

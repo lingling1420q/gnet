@@ -1,14 +1,26 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-
-// Copyright 2019 smallnest&Allenxuxu. All rights reserved.
-// Use of this source code is governed by a MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Chao yuepan, Andy Pan, Allen Xu
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 package ringbuffer
 
 import (
 	"errors"
-	"unsafe"
 
 	"github.com/panjf2000/gnet/internal"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
@@ -28,6 +40,9 @@ type RingBuffer struct {
 	w       int // next position to write
 	isEmpty bool
 }
+
+// EmptyRingBuffer can be used as a placeholder for those closed connections.
+var EmptyRingBuffer = New(0)
 
 // New returns a new RingBuffer whose buffer has the given size.
 func New(size int) *RingBuffer {
@@ -106,9 +121,6 @@ func (r *RingBuffer) Shift(n int) {
 
 	if n < r.Length() {
 		r.r = (r.r + n) & r.mask
-		if r.r == r.w {
-			r.isEmpty = true
-		}
 	} else {
 		r.Reset()
 	}
@@ -140,9 +152,9 @@ func (r *RingBuffer) Read(p []byte) (n int, err error) {
 			n = len(p)
 		}
 		copy(p, r.buf[r.r:r.r+n])
-		r.r = r.r + n
+		r.r += n
 		if r.r == r.w {
-			r.isEmpty = true
+			r.Reset()
 		}
 		return
 	}
@@ -162,7 +174,7 @@ func (r *RingBuffer) Read(p []byte) (n int, err error) {
 	}
 	r.r = (r.r + n) & r.mask
 	if r.r == r.w {
-		r.isEmpty = true
+		r.Reset()
 	}
 
 	return n, err
@@ -179,7 +191,7 @@ func (r *RingBuffer) ReadByte() (b byte, err error) {
 		r.r = 0
 	}
 	if r.r == r.w {
-		r.isEmpty = true
+		r.Reset()
 	}
 
 	return b, err
@@ -227,7 +239,7 @@ func (r *RingBuffer) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// WriteByte writes one byte into buffer
+// WriteByte writes one byte into buffer.
 func (r *RingBuffer) WriteByte(c byte) error {
 	if r.Free() < 1 {
 		r.malloc(1)
@@ -287,10 +299,7 @@ func (r *RingBuffer) Free() int {
 
 // WriteString writes the contents of the string s to buffer, which accepts a slice of bytes.
 func (r *RingBuffer) WriteString(s string) (n int, err error) {
-	x := (*[2]uintptr)(unsafe.Pointer(&s))
-	h := [3]uintptr{x[0], x[1], x[1]}
-	buf := *(*[]byte)(unsafe.Pointer(&h))
-	return r.Write(buf)
+	return r.Write(internal.StringToBytes(s))
 }
 
 // ByteBuffer returns all available read bytes. It does not move the read pointer and only copy the available data.
@@ -361,14 +370,20 @@ func (r *RingBuffer) IsEmpty() bool {
 
 // Reset the read pointer and writer pointer to zero.
 func (r *RingBuffer) Reset() {
-	r.r = 0
-	r.w = 0
 	r.isEmpty = true
+	r.r, r.w = 0, 0
+
+	// Shrink the internal buffer for saving memory.
+	newCap := r.size >> 1
+	newBuf := make([]byte, newCap)
+	r.buf = newBuf
+	r.size = newCap
+	r.mask = newCap - 1
 }
 
 func (r *RingBuffer) malloc(cap int) {
 	var newCap int
-	if r.size == 0 && initSize >= cap {
+	if r.size == 0 && cap < initSize {
 		newCap = initSize
 	} else {
 		newCap = internal.CeilToPowerOfTwo(r.size + cap)
@@ -376,9 +391,9 @@ func (r *RingBuffer) malloc(cap int) {
 	newBuf := make([]byte, newCap)
 	oldLen := r.Length()
 	_, _ = r.Read(newBuf)
+	r.buf = newBuf
 	r.r = 0
 	r.w = oldLen
 	r.size = newCap
 	r.mask = newCap - 1
-	r.buf = newBuf
 }

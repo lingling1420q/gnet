@@ -1,27 +1,45 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2017 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2017 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
-	"os"
 	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/panjf2000/gnet/errors"
 	"github.com/panjf2000/gnet/pool/bytebuffer"
 	"github.com/panjf2000/gnet/pool/goroutine"
-	"github.com/valyala/bytebufferpool"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestCodecServe(t *testing.T) {
@@ -167,6 +185,7 @@ func (s *testCodecServer) OnOpened(c Conn) (out []byte, action Action) {
 	}
 	return
 }
+
 func (s *testCodecServer) OnClosed(c Conn, err error) (action Action) {
 	if c.Context() != c {
 		panic("invalid context")
@@ -180,6 +199,7 @@ func (s *testCodecServer) OnClosed(c Conn, err error) (action Action) {
 
 	return
 }
+
 func (s *testCodecServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	if s.async {
 		if frame != nil {
@@ -193,6 +213,7 @@ func (s *testCodecServer) React(frame []byte, c Conn) (out []byte, action Action
 	out = frame
 	return
 }
+
 func (s *testCodecServer) Tick() (delay time.Duration, action Action) {
 	if atomic.LoadInt32(&s.started) == 0 {
 		for i := 0; i < s.nclients; i++ {
@@ -234,15 +255,12 @@ func testCodecServe(network, addr string, multicore, async bool, nclients int, r
 	if n > 4 {
 		n = 0
 	}
-	ts := &testCodecServer{network: network, addr: addr, multicore: multicore, async: async, nclients: nclients,
-		codec: codec, workerPool: goroutine.Default()}
-	if reuseport {
-		err = Serve(ts, network+"://"+addr, WithMulticore(multicore), WithTicker(true),
-			WithTCPKeepAlive(time.Minute*5), WithCodec(codec), WithReusePort(true))
-	} else {
-		err = Serve(ts, network+"://"+addr, WithMulticore(multicore), WithTicker(true),
-			WithTCPKeepAlive(time.Minute*5), WithCodec(codec))
+	ts := &testCodecServer{
+		network: network, addr: addr, multicore: multicore, async: async, nclients: nclients,
+		codec: codec, workerPool: goroutine.Default(),
 	}
+	err = Serve(ts, network+"://"+addr, WithMulticore(multicore), WithTicker(true), WithLogLevel(zapcore.DebugLevel),
+		WithTCPKeepAlive(time.Minute*5), WithSocketRecvBuffer(8*1024), WithSocketSendBuffer(8*1024), WithCodec(codec), WithReusePort(reuseport))
 	if err != nil {
 		panic(err)
 	}
@@ -266,7 +284,7 @@ func startCodecClient(network, addr string, multicore, async bool, codec ICodec)
 	duration := time.Duration((rand.Float64()*2+1)*float64(time.Second)) / 8
 	start := time.Now()
 	for time.Since(start) < duration {
-		//data := []byte("Hello, World")
+		// data := []byte("Hello, World")
 		data := make([]byte, 1024)
 		rand.Read(data)
 		encodedData, _ := codec.Encode(nil, data)
@@ -277,8 +295,8 @@ func startCodecClient(network, addr string, multicore, async bool, codec ICodec)
 		if _, err := io.ReadFull(rd, data2); err != nil {
 			panic(err)
 		}
-		if string(encodedData) != string(data2) && !async {
-			//panic(fmt.Sprintf("mismatch %s/multi-core:%t: %d vs %d bytes, %s:%s", network, multicore,
+		if !bytes.Equal(encodedData, data2) && !async {
+			// panic(fmt.Sprintf("mismatch %s/multi-core:%t: %d vs %d bytes, %s:%s", network, multicore,
 			//	len(encodedData), len(data2), string(encodedData), string(data2)))
 			panic(fmt.Sprintf("mismatch %s/multi-core:%t: %d vs %d bytes", network, multicore, len(encodedData), len(data2)))
 		}
@@ -408,7 +426,6 @@ type testServer struct {
 	clientActive int32
 	disconnected int32
 	workerPool   *goroutine.Pool
-	bytesList    []*bytebufferpool.ByteBuffer
 }
 
 func (s *testServer) OnInitComplete(svr Server) (action Action) {
@@ -428,6 +445,7 @@ func (s *testServer) OnOpened(c Conn) (out []byte, action Action) {
 	}
 	return
 }
+
 func (s *testServer) OnClosed(c Conn, err error) (action Action) {
 	if err != nil {
 		fmt.Printf("error occurred on closed, %v\n", err)
@@ -440,33 +458,31 @@ func (s *testServer) OnClosed(c Conn, err error) (action Action) {
 	if atomic.LoadInt32(&s.connected) == atomic.LoadInt32(&s.disconnected) &&
 		atomic.LoadInt32(&s.disconnected) == int32(s.nclients) {
 		action = Shutdown
-		for i := range s.bytesList {
-			bytebuffer.Put(s.bytesList[i])
-		}
 		s.workerPool.Release()
 	}
 
 	return
 }
+
 func (s *testServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	if s.async {
+		buf := bytebuffer.Get()
+		_, _ = buf.Write(frame)
+
 		if s.network == "tcp" || s.network == "unix" {
-			_ = c.BufferLength()
-			buf := bytebuffer.Get()
-			_, _ = buf.Write(frame)
-			s.bytesList = append(s.bytesList, buf)
 			// just for test
+			_ = c.BufferLength()
 			c.ShiftN(1)
+
 			_ = s.workerPool.Submit(
 				func() {
 					_ = c.AsyncWrite(buf.Bytes())
 				})
 			return
-		}
-		if s.network == "udp" {
+		} else if s.network == "udp" {
 			_ = s.workerPool.Submit(
 				func() {
-					_ = c.SendTo(frame)
+					_ = c.SendTo(buf.Bytes())
 				})
 			return
 		}
@@ -475,6 +491,7 @@ func (s *testServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	out = frame
 	return
 }
+
 func (s *testServer) Tick() (delay time.Duration, action Action) {
 	if atomic.LoadInt32(&s.started) == 0 {
 		for i := 0; i < s.nclients; i++ {
@@ -502,9 +519,10 @@ func testServe(network, addr string, reuseport, multicore, async bool, nclients 
 		multicore:  multicore,
 		async:      async,
 		nclients:   nclients,
-		workerPool: goroutine.Default()}
-	must(Serve(ts, network+"://"+addr, WithMulticore(multicore), WithReusePort(reuseport), WithTicker(true),
-		WithTCPKeepAlive(time.Minute*1), WithLoadBalancing(lb)))
+		workerPool: goroutine.Default(),
+	}
+	must(Serve(ts, network+"://"+addr, WithLockOSThread(async), WithMulticore(multicore), WithReusePort(reuseport), WithTicker(true),
+		WithTCPKeepAlive(time.Minute*1), WithTCPNoDelay(TCPDelay), WithLoadBalancing(lb)))
 }
 
 func startClient(network, addr string, multicore, async bool) {
@@ -527,7 +545,7 @@ func startClient(network, addr string, multicore, async bool) {
 	duration := time.Duration((rand.Float64()*2+1)*float64(time.Second)) / 8
 	start := time.Now()
 	for time.Since(start) < duration {
-		//sz := rand.Intn(10) * (1024 * 1024)
+		// sz := rand.Intn(10) * (1024 * 1024)
 		sz := 1024 * 1024
 		data := make([]byte, sz)
 		if network == "udp" || network == "unix" {
@@ -544,14 +562,14 @@ func startClient(network, addr string, multicore, async bool) {
 		if _, err := io.ReadFull(rd, data2); err != nil {
 			panic(err)
 		}
-		if string(data) != string(data2) && !async {
+		if !bytes.Equal(data, data2) && !async {
 			panic(fmt.Sprintf("mismatch %s/multi-core:%t: %d vs %d bytes\n", network, multicore, len(data), len(data2)))
 		}
 	}
 }
 
 func must(err error) {
-	if err != nil && err != ErrUnsupportedProtocol {
+	if err != nil && err != errors.ErrUnsupportedProtocol {
 		panic(err)
 	}
 }
@@ -566,8 +584,29 @@ func TestDefaultGnetServer(t *testing.T) {
 	svr.Tick()
 }
 
+type testBadAddrServer struct {
+	*EventServer
+}
+
+func (t *testBadAddrServer) OnInitComplete(srv Server) (action Action) {
+	return Shutdown
+}
+
+func TestBadAddresses(t *testing.T) {
+	events := new(testBadAddrServer)
+	if err := Serve(events, "tulip://howdy"); err == nil {
+		t.Fatalf("expected error")
+	}
+	if err := Serve(events, "howdy"); err == nil {
+		t.Fatalf("expected error")
+	}
+	if err := Serve(events, "tcp://"); err != nil {
+		t.Fatalf("expected nil, got '%v'", err)
+	}
+}
+
 func TestTick(t *testing.T) {
-	testTick("tcp4", ":9991", t)
+	testTick("tcp", ":9989", t)
 }
 
 type testTickServer struct {
@@ -597,30 +636,34 @@ func testTick(network, addr string, t *testing.T) {
 }
 
 func TestWakeConn(t *testing.T) {
-	testWakeConn("tcp", ":9000")
+	testWakeConn("tcp", ":9990")
 }
 
 type testWakeConnServer struct {
 	*EventServer
 	network string
 	addr    string
-	conn    Conn
+	conn    chan Conn
+	c       Conn
 	wake    bool
 }
 
 func (t *testWakeConnServer) OnOpened(c Conn) (out []byte, action Action) {
-	t.conn = c
+	t.conn <- c
 	return
 }
+
 func (t *testWakeConnServer) OnClosed(c Conn, err error) (action Action) {
 	action = Shutdown
 	return
 }
+
 func (t *testWakeConnServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	out = []byte("Waking up.")
 	action = -1
 	return
 }
+
 func (t *testWakeConnServer) Tick() (delay time.Duration, action Action) {
 	if !t.wake {
 		t.wake = true
@@ -638,15 +681,18 @@ func (t *testWakeConnServer) Tick() (delay time.Duration, action Action) {
 		}()
 		return
 	}
-	_ = t.conn.Wake()
+	t.c = <-t.conn
+	_ = t.c.Wake()
 	delay = time.Millisecond * 100
 	return
 }
 
 func testWakeConn(network, addr string) {
-	svr := &testWakeConnServer{network: network, addr: addr}
+	svr := &testWakeConnServer{network: network, addr: addr, conn: make(chan Conn, 1)}
+	logger := zap.NewExample()
 	must(Serve(svr, network+"://"+addr, WithTicker(true), WithNumEventLoop(2*runtime.NumCPU()),
-		WithLogger(log.New(os.Stderr, "", log.LstdFlags))))
+		WithLogger(logger.Sugar())))
+	_ = logger.Sync()
 }
 
 func TestShutdown(t *testing.T) {
@@ -666,10 +712,12 @@ func (t *testShutdownServer) OnOpened(c Conn) (out []byte, action Action) {
 	atomic.AddInt64(&t.clients, 1)
 	return
 }
+
 func (t *testShutdownServer) OnClosed(c Conn, err error) (action Action) {
 	atomic.AddInt64(&t.clients, -1)
 	return
 }
+
 func (t *testShutdownServer) Tick() (delay time.Duration, action Action) {
 	if t.count == 0 {
 		// start clients
@@ -684,10 +732,8 @@ func (t *testShutdownServer) Tick() (delay time.Duration, action Action) {
 				}
 			}()
 		}
-	} else {
-		if int(atomic.LoadInt64(&t.clients)) == t.N {
-			action = Shutdown
-		}
+	} else if int(atomic.LoadInt64(&t.clients)) == t.N {
+		action = Shutdown
 	}
 	t.count++
 	delay = time.Second / 20
@@ -702,29 +748,8 @@ func testShutdown(network, addr string) {
 	}
 }
 
-type testBadAddrServer struct {
-	*EventServer
-}
-
-func (t *testBadAddrServer) OnInitComplete(srv Server) (action Action) {
-	return Shutdown
-}
-
-func TestBadAddresses(t *testing.T) {
-	events := new(testBadAddrServer)
-	if err := Serve(events, "tulip://howdy"); err == nil {
-		t.Fatalf("expected error")
-	}
-	if err := Serve(events, "howdy"); err == nil {
-		t.Fatalf("expected error")
-	}
-	if err := Serve(events, "tcp://"); err != nil {
-		t.Fatalf("expected nil, got '%v'", err)
-	}
-}
-
 func TestCloseActionError(t *testing.T) {
-	testCloseActionError("tcp", ":9991")
+	testCloseActionError("tcp", ":9992")
 }
 
 type testCloseActionErrorServer struct {
@@ -737,11 +762,13 @@ func (t *testCloseActionErrorServer) OnClosed(c Conn, err error) (action Action)
 	action = Shutdown
 	return
 }
+
 func (t *testCloseActionErrorServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	out = frame
 	action = Close
 	return
 }
+
 func (t *testCloseActionErrorServer) Tick() (delay time.Duration, action Action) {
 	if !t.action {
 		t.action = true
@@ -770,7 +797,7 @@ func testCloseActionError(network, addr string) {
 }
 
 func TestShutdownActionError(t *testing.T) {
-	testShutdownActionError("tcp", ":9991")
+	testShutdownActionError("tcp", ":9993")
 }
 
 type testShutdownActionErrorServer struct {
@@ -785,6 +812,7 @@ func (t *testShutdownActionErrorServer) React(frame []byte, c Conn) (out []byte,
 	action = Shutdown
 	return
 }
+
 func (t *testShutdownActionErrorServer) Tick() (delay time.Duration, action Action) {
 	if !t.action {
 		t.action = true
@@ -813,7 +841,7 @@ func testShutdownActionError(network, addr string) {
 }
 
 func TestCloseActionOnOpen(t *testing.T) {
-	testCloseActionOnOpen("tcp", ":9991")
+	testCloseActionOnOpen("tcp", ":9994")
 }
 
 type testCloseActionOnOpenServer struct {
@@ -826,10 +854,12 @@ func (t *testCloseActionOnOpenServer) OnOpened(c Conn) (out []byte, action Actio
 	action = Close
 	return
 }
+
 func (t *testCloseActionOnOpenServer) OnClosed(c Conn, err error) (action Action) {
 	action = Shutdown
 	return
 }
+
 func (t *testCloseActionOnOpenServer) Tick() (delay time.Duration, action Action) {
 	if !t.action {
 		t.action = true
@@ -851,7 +881,7 @@ func testCloseActionOnOpen(network, addr string) {
 }
 
 func TestShutdownActionOnOpen(t *testing.T) {
-	testShutdownActionOnOpen("tcp", ":9991")
+	testShutdownActionOnOpen("tcp", ":9995")
 }
 
 type testShutdownActionOnOpenServer struct {
@@ -864,6 +894,12 @@ func (t *testShutdownActionOnOpenServer) OnOpened(c Conn) (out []byte, action Ac
 	action = Shutdown
 	return
 }
+
+func (t *testShutdownActionOnOpenServer) OnShutdown(s Server) {
+	dupFD, err := s.DupFd()
+	fmt.Printf("dup fd: %d with error: %v\n", dupFD, err)
+}
+
 func (t *testShutdownActionOnOpenServer) Tick() (delay time.Duration, action Action) {
 	if !t.action {
 		t.action = true
@@ -900,6 +936,7 @@ func (t *testUDPShutdownServer) React(frame []byte, c Conn) (out []byte, action 
 	action = Shutdown
 	return
 }
+
 func (t *testUDPShutdownServer) Tick() (delay time.Duration, action Action) {
 	if !t.tick {
 		t.tick = true
@@ -929,7 +966,7 @@ func testUDPShutdown(network, addr string) {
 }
 
 func TestCloseConnection(t *testing.T) {
-	testCloseConnection("tcp", ":9991")
+	testCloseConnection("tcp", ":9996")
 }
 
 type testCloseConnectionServer struct {
@@ -942,6 +979,7 @@ func (t *testCloseConnectionServer) OnClosed(c Conn, err error) (action Action) 
 	action = Shutdown
 	return
 }
+
 func (t *testCloseConnectionServer) React(frame []byte, c Conn) (out []byte, action Action) {
 	out = frame
 	go func() {
@@ -950,10 +988,11 @@ func (t *testCloseConnectionServer) React(frame []byte, c Conn) (out []byte, act
 	}()
 	return
 }
+
 func (t *testCloseConnectionServer) Tick() (delay time.Duration, action Action) {
+	delay = time.Millisecond * 100
 	if !t.action {
 		t.action = true
-		delay = time.Millisecond * 100
 		go func() {
 			conn, err := net.Dial(t.network, t.addr)
 			must(err)
@@ -973,11 +1012,155 @@ func (t *testCloseConnectionServer) Tick() (delay time.Duration, action Action) 
 		}()
 		return
 	}
-	delay = time.Millisecond * 100
 	return
 }
 
 func testCloseConnection(network, addr string) {
 	events := &testCloseConnectionServer{network: network, addr: addr}
 	must(Serve(events, network+"://"+addr, WithTicker(true)))
+}
+
+func TestServerOptionsCheck(t *testing.T) {
+	if err := Serve(&EventServer{}, "tcp://:3500", WithNumEventLoop(10001), WithLockOSThread(true)); err != errors.ErrTooManyEventLoopThreads {
+		t.Fail()
+		t.Log("error returned with LockOSThread option")
+	}
+}
+
+func TestStop(t *testing.T) {
+	testStop("tcp", ":9997")
+}
+
+type testStopServer struct {
+	*EventServer
+	network, addr, protoAddr string
+	action                   bool
+}
+
+func (t *testStopServer) OnClosed(c Conn, err error) (action Action) {
+	fmt.Println("closing connection...")
+	return
+}
+
+func (t *testStopServer) React(frame []byte, c Conn) (out []byte, action Action) {
+	out = frame
+	return
+}
+
+func (t *testStopServer) Tick() (delay time.Duration, action Action) {
+	delay = time.Millisecond * 100
+	if !t.action {
+		t.action = true
+		go func() {
+			conn, err := net.Dial(t.network, t.addr)
+			must(err)
+			defer conn.Close()
+			data := []byte("Hello World!")
+			_, _ = conn.Write(data)
+			_, err = conn.Read(data)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println(string(data))
+
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				fmt.Println("stop server...", Stop(ctx, t.protoAddr))
+			}()
+
+			// waiting the server shutdown.
+			_, err = conn.Read(data)
+			if err == nil {
+				panic(err)
+			}
+		}()
+		return
+	}
+	return
+}
+
+func testStop(network, addr string) {
+	events := &testStopServer{network: network, addr: addr, protoAddr: network + "://" + addr}
+	must(Serve(events, events.protoAddr, WithTicker(true)))
+}
+
+type testClosedWakeUpServer struct {
+	*EventServer
+	network, addr, protoAddr string
+
+	readen       chan struct{}
+	serverClosed chan struct{}
+	clientClosed chan struct{}
+}
+
+func (tes *testClosedWakeUpServer) OnInitComplete(_ Server) (action Action) {
+	go func() {
+		c, err := net.Dial(tes.network, tes.addr)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = c.Write([]byte("hello"))
+		if err != nil {
+			panic(err)
+		}
+
+		<-tes.readen
+		_, err = c.Write([]byte("hello again"))
+		if err != nil {
+			panic(err)
+		}
+
+		must(c.Close())
+		close(tes.clientClosed)
+		<-tes.serverClosed
+
+		fmt.Println("stop server...", Stop(context.TODO(), tes.protoAddr))
+	}()
+
+	return None
+}
+
+func (tes *testClosedWakeUpServer) React(_ []byte, conn Conn) ([]byte, Action) {
+	if conn.RemoteAddr() == nil {
+		panic("react on closed conn")
+	}
+
+	select {
+	case <-tes.readen:
+	default:
+		close(tes.readen)
+	}
+
+	// actually goroutines here needed only on windows since its async actions
+	// rely on an unbuffered channel and since we already into it - this will
+	// block forever.
+	go func() { must(conn.Wake()) }()
+	go func() { must(conn.Close()) }()
+
+	<-tes.clientClosed
+
+	return []byte("answer"), None
+}
+
+func (tes *testClosedWakeUpServer) OnClosed(c Conn, err error) (action Action) {
+	select {
+	case <-tes.serverClosed:
+	default:
+		close(tes.serverClosed)
+	}
+	return
+}
+
+// Test should not panic when we wake-up server_closed conn.
+func TestClosedWakeUp(t *testing.T) {
+	events := &testClosedWakeUpServer{
+		EventServer: &EventServer{}, network: "tcp", addr: ":8888", protoAddr: "tcp://:8888",
+		clientClosed: make(chan struct{}),
+		serverClosed: make(chan struct{}),
+		readen:       make(chan struct{}),
+	}
+
+	must(Serve(events, events.protoAddr))
 }

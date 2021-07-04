@@ -1,20 +1,36 @@
-// Copyright 2019 Andy Pan. All rights reserved.
-// Copyright 2018 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by an MIT-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Andy Pan
+// Copyright (c) 2018 Joshua J Baker
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
 package gnet
 
 import (
-	"log"
+	"context"
 	"net"
-	"os"
-	"runtime"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
-	"github.com/panjf2000/gnet/internal/netpoll"
+	"github.com/panjf2000/gnet/errors"
+	"github.com/panjf2000/gnet/internal"
+	"github.com/panjf2000/gnet/internal/logging"
 )
 
 // Action is an action that occurs after the completion of an event.
@@ -31,14 +47,6 @@ const (
 	Shutdown
 )
 
-var defaultLogger = Logger(log.New(os.Stderr, "", log.LstdFlags))
-
-// Logger is used for logging formatted messages.
-type Logger interface {
-	// Printf must have the same semantics as log.Printf.
-	Printf(format string, args ...interface{})
-}
-
 // Server represents a server context which provides information about the
 // running server and has control functions for managing state.
 type Server struct {
@@ -47,7 +55,7 @@ type Server struct {
 	// Multicore indicates whether the server will be effectively created with multi-cores, if so,
 	// then you must take care of synchronizing the shared data between all event callbacks, otherwise,
 	// it will run the server with single thread. The number of threads in the server will be automatically
-	// assigned to the value of runtime.NumCPU().
+	// assigned to the value of logical CPUs usable by the current process.
 	Multicore bool
 
 	// The Addr parameter is the listening address that align
@@ -66,10 +74,21 @@ type Server struct {
 
 // CountConnections counts the number of currently active connections and returns it.
 func (s Server) CountConnections() (count int) {
-	s.svr.subEventLoopSet.iterate(func(i int, el *eventloop) bool {
-		count += int(atomic.LoadInt32(&el.connCount))
+	s.svr.lb.iterate(func(i int, el *eventloop) bool {
+		count += int(el.loadConn())
 		return true
 	})
+	return
+}
+
+// DupFd returns a copy of the underlying file descriptor of listener.
+// It is the caller's responsibility to close dupFD when finished.
+// Closing listener does not affect dupFD, and closing dupFD does not affect listener.
+func (s Server) DupFd() (dupFD int, err error) {
+	dupFD, sc, err := s.svr.ln.Dup()
+	if err != nil {
+		logging.Warnf("%s failed when duplicating new fd\n", sc)
+	}
 	return
 }
 
@@ -109,7 +128,7 @@ type Conn interface {
 	BufferLength() (size int)
 
 	// InboundBuffer returns the inbound ring-buffer.
-	//InboundBuffer() *ringbuffer.RingBuffer
+	// InboundBuffer() *ringbuffer.RingBuffer
 
 	// SendTo writes data for UDP sockets, it allows you to send data back to UDP socket in individual goroutines.
 	SendTo(buf []byte) error
@@ -141,6 +160,9 @@ type (
 		// OnOpened fires when a new connection has been opened.
 		// The parameter:c has information about the connection such as it's local and remote address.
 		// Parameter:out is the return value which is going to be sent back to the client.
+		// It is generally not recommended to send large amounts of data back to the client in OnOpened.
+		//
+		// Note that the bytes returned by OnOpened will be sent back to client without being encoded.
 		OnOpened(c Conn) (out []byte, action Action)
 
 		// OnClosed fires when a connection has been closed.
@@ -164,8 +186,7 @@ type (
 	// EventServer is a built-in implementation of EventHandler which sets up each method with a default implementation,
 	// you can compose it with your own implementation of EventHandler when you don't want to implement all methods
 	// in EventHandler.
-	EventServer struct {
-	}
+	EventServer struct{}
 )
 
 // OnInitComplete fires when the server is ready for accepting connections.
@@ -224,63 +245,85 @@ func (es *EventServer) Tick() (delay time.Duration, action Action) {
 //  unix  - Unix Domain Socket
 //
 // The "tcp" network scheme is assumed when one is not specified.
-func Serve(eventHandler EventHandler, addr string, opts ...Option) (err error) {
-	var ln listener
-	defer func() {
-		ln.close()
-		if ln.network == "unix" {
-			sniffErrorAndLog(os.RemoveAll(ln.addr))
-		}
-	}()
-
+func Serve(eventHandler EventHandler, protoAddr string, opts ...Option) (err error) {
 	options := loadOptions(opts...)
 
-	if options.Logger != nil {
-		defaultLogger = options.Logger
-	}
+	logging.Init(options.LogLevel)
 
-	ln.network, ln.addr = parseAddr(addr)
-	switch ln.network {
-	case "udp", "udp4", "udp6":
-		if options.ReusePort {
-			ln.pconn, err = netpoll.ReusePortListenPacket(ln.network, ln.addr)
-		} else {
-			ln.pconn, err = net.ListenPacket(ln.network, ln.addr)
-		}
-	case "unix":
-		sniffErrorAndLog(os.RemoveAll(ln.addr))
-		if runtime.GOOS == "windows" {
-			err = ErrUnsupportedProtocol
-			break
-		}
-		fallthrough
-	case "tcp", "tcp4", "tcp6":
-		if options.ReusePort {
-			ln.ln, err = netpoll.ReusePortListen(ln.network, ln.addr)
-		} else {
-			ln.ln, err = net.Listen(ln.network, ln.addr)
-		}
-	default:
-		err = ErrUnsupportedProtocol
+	if options.LogPath != "" {
+		err = logging.SetupLoggerWithPath(options.LogPath, options.LogLevel)
 	}
 	if err != nil {
 		return
 	}
+	if options.Logger != nil {
+		logging.SetupLogger(options.Logger, options.LogLevel)
+	}
+	defer logging.Cleanup()
 
-	if ln.pconn != nil {
-		ln.lnaddr = ln.pconn.LocalAddr()
-	} else {
-		ln.lnaddr = ln.ln.Addr()
+	// The maximum number of operating system threads that the Go program can use is initially set to 10000,
+	// which should be the maximum amount of I/O event-loops locked to OS threads users can start up.
+	if options.LockOSThread && options.NumEventLoop > 10000 {
+		logging.Errorf("too many event-loops under LockOSThread mode, should be less than 10,000 "+
+			"while you are trying to set up %d\n", options.NumEventLoop)
+		return errors.ErrTooManyEventLoopThreads
 	}
 
-	if err = ln.renormalize(); err != nil {
+	if rbc := options.ReadBufferCap; rbc <= 0 {
+		options.ReadBufferCap = 0x4000
+	} else {
+		options.ReadBufferCap = internal.CeilToPowerOfTwo(rbc)
+	}
+
+	network, addr := parseProtoAddr(protoAddr)
+
+	var ln *listener
+	if ln, err = initListener(network, addr, options); err != nil {
 		return
 	}
+	defer ln.close()
 
-	return serve(eventHandler, &ln, options)
+	return serve(eventHandler, ln, options, protoAddr)
 }
 
-func parseAddr(addr string) (network, address string) {
+var (
+	allServers sync.Map
+
+	// shutdownPollInterval is how often we poll to check whether server has been shut down during gnet.Stop().
+	shutdownPollInterval = 500 * time.Millisecond
+)
+
+// Stop gracefully shuts down the server without interrupting any active event-loops,
+// it waits indefinitely for connections and event-loops to be closed and then shuts down.
+func Stop(ctx context.Context, protoAddr string) error {
+	var svr *server
+	if s, ok := allServers.Load(protoAddr); ok {
+		svr = s.(*server)
+		svr.signalShutdown()
+		defer allServers.Delete(protoAddr)
+	} else {
+		return errors.ErrServerInShutdown
+	}
+
+	if svr.isInShutdown() {
+		return errors.ErrServerInShutdown
+	}
+
+	ticker := time.NewTicker(shutdownPollInterval)
+	defer ticker.Stop()
+	for {
+		if svr.isInShutdown() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func parseProtoAddr(addr string) (network, address string) {
 	network = "tcp"
 	address = strings.ToLower(addr)
 	if strings.Contains(address, "://") {
@@ -289,10 +332,4 @@ func parseAddr(addr string) (network, address string) {
 		address = pair[1]
 	}
 	return
-}
-
-func sniffErrorAndLog(err error) {
-	if err != nil {
-		defaultLogger.Printf(err.Error())
-	}
 }

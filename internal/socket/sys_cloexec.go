@@ -1,5 +1,4 @@
-// Copyright (c) 2019 Andy Pan
-// Copyright (c) 2018 Joshua J Baker
+// Copyright (c) 2020 Andy Pan
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -19,56 +18,30 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package gnet
+// +build darwin
+
+package socket
 
 import (
-	"runtime"
-	"time"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-func (svr *server) listenerRun(lockOSThread bool) {
-	if lockOSThread {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
+func sysSocket(family, sotype, proto int) (fd int, err error) {
+	syscall.ForkLock.RLock()
+	if fd, err = unix.Socket(family, sotype, proto); err == nil {
+		unix.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
+
+	if err != nil {
+		return
 	}
 
-	var err error
-	defer func() { svr.signalShutdownWithErr(err) }()
-	var buffer [0x10000]byte
-	for {
-		if svr.ln.pconn != nil {
-			// Read data from UDP socket.
-			n, addr, e := svr.ln.pconn.ReadFrom(buffer[:])
-			if e != nil {
-				err = e
-				return
-			}
-
-			el := svr.lb.next(addr)
-			c := newUDPConn(el, svr.ln.lnaddr, addr)
-			el.ch <- packUDPConn(c, buffer[:n])
-		} else {
-			// Accept TCP socket.
-			conn, e := svr.ln.ln.Accept()
-			if e != nil {
-				err = e
-				return
-			}
-			el := svr.lb.next(conn.RemoteAddr())
-			c := newTCPConn(conn, el)
-			el.ch <- c
-			go func() {
-				var buffer [0x10000]byte
-				for {
-					n, err := c.conn.Read(buffer[:])
-					if err != nil {
-						_ = c.conn.SetReadDeadline(time.Time{})
-						el.ch <- &stderr{c, err}
-						return
-					}
-					el.ch <- packTCPConn(c, buffer[:n])
-				}
-			}()
-		}
+	if err = unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
 	}
+
+	return
 }

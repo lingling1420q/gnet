@@ -1,5 +1,5 @@
-// Copyright (c) 2019 Andy Pan
-// Copyright (c) 2018 Joshua J Baker
+// Copyright (c) 2020 Andy Pan
+// Copyright (c) 2017 Ma Weiwei, Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -19,56 +19,35 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package gnet
+// +build freebsd dragonfly darwin
+
+package socket
 
 import (
 	"runtime"
-	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-func (svr *server) listenerRun(lockOSThread bool) {
-	if lockOSThread {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
+func maxListenerBacklog() int {
+	var (
+		n   uint32
+		err error
+	)
+	switch runtime.GOOS {
+	case "darwin":
+		n, err = unix.SysctlUint32("kern.ipc.somaxconn")
+	case "freebsd":
+		n, err = unix.SysctlUint32("kern.ipc.soacceptqueue")
 	}
-
-	var err error
-	defer func() { svr.signalShutdownWithErr(err) }()
-	var buffer [0x10000]byte
-	for {
-		if svr.ln.pconn != nil {
-			// Read data from UDP socket.
-			n, addr, e := svr.ln.pconn.ReadFrom(buffer[:])
-			if e != nil {
-				err = e
-				return
-			}
-
-			el := svr.lb.next(addr)
-			c := newUDPConn(el, svr.ln.lnaddr, addr)
-			el.ch <- packUDPConn(c, buffer[:n])
-		} else {
-			// Accept TCP socket.
-			conn, e := svr.ln.ln.Accept()
-			if e != nil {
-				err = e
-				return
-			}
-			el := svr.lb.next(conn.RemoteAddr())
-			c := newTCPConn(conn, el)
-			el.ch <- c
-			go func() {
-				var buffer [0x10000]byte
-				for {
-					n, err := c.conn.Read(buffer[:])
-					if err != nil {
-						_ = c.conn.SetReadDeadline(time.Time{})
-						el.ch <- &stderr{c, err}
-						return
-					}
-					el.ch <- packTCPConn(c, buffer[:n])
-				}
-			}()
-		}
+	if n == 0 || err != nil {
+		return unix.SOMAXCONN
 	}
+	// FreeBSD stores the backlog in a uint16, as does Linux.
+	// Assume the other BSDs do too. Truncate number to avoid wrapping.
+	// See issue 5030.
+	if n > 1<<16-1 {
+		n = 1<<16 - 1
+	}
+	return int(n)
 }

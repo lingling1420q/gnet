@@ -1,5 +1,4 @@
-// Copyright (c) 2019 Andy Pan
-// Copyright (c) 2018 Joshua J Baker
+// Copyright (c) 2017 Ma Weiwei, Max Riveiro
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -19,56 +18,46 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package gnet
+package socket
 
 import (
-	"runtime"
-	"time"
+	"bufio"
+	"os"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
-func (svr *server) listenerRun(lockOSThread bool) {
-	if lockOSThread {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
+func maxListenerBacklog() int {
+	fd, err := os.Open("/proc/sys/net/core/somaxconn")
+	if err != nil {
+		return unix.SOMAXCONN
+	}
+	defer fd.Close()
+
+	rd := bufio.NewReader(fd)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		return unix.SOMAXCONN
 	}
 
-	var err error
-	defer func() { svr.signalShutdownWithErr(err) }()
-	var buffer [0x10000]byte
-	for {
-		if svr.ln.pconn != nil {
-			// Read data from UDP socket.
-			n, addr, e := svr.ln.pconn.ReadFrom(buffer[:])
-			if e != nil {
-				err = e
-				return
-			}
-
-			el := svr.lb.next(addr)
-			c := newUDPConn(el, svr.ln.lnaddr, addr)
-			el.ch <- packUDPConn(c, buffer[:n])
-		} else {
-			// Accept TCP socket.
-			conn, e := svr.ln.ln.Accept()
-			if e != nil {
-				err = e
-				return
-			}
-			el := svr.lb.next(conn.RemoteAddr())
-			c := newTCPConn(conn, el)
-			el.ch <- c
-			go func() {
-				var buffer [0x10000]byte
-				for {
-					n, err := c.conn.Read(buffer[:])
-					if err != nil {
-						_ = c.conn.SetReadDeadline(time.Time{})
-						el.ch <- &stderr{c, err}
-						return
-					}
-					el.ch <- packTCPConn(c, buffer[:n])
-				}
-			}()
-		}
+	f := strings.Fields(line)
+	if len(f) < 1 {
+		return unix.SOMAXCONN
 	}
+
+	n, err := strconv.Atoi(f[0])
+	if err != nil || n == 0 {
+		return unix.SOMAXCONN
+	}
+
+	// Linux stores the backlog in a uint16.
+	// Truncate number to avoid wrapping.
+	// See issue 5030.
+	if n > 1<<16-1 {
+		n = 1<<16 - 1
+	}
+
+	return n
 }
